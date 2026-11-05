@@ -15,6 +15,10 @@
 #   core_util_<stage>.rpt      hornet_core synthesized alone (out of context)
 #   core_util_hier_<stage>.rpt the same per hierarchy level
 #   core_timing_route.rpt      its timing summary at the board's clock (impl=1 only)
+#   <soc|core>_critical.rpt    the worst setup path (impl=1 only)
+#   soc_core_critical.rpt      the worst setup path with both ends in the core, in the SoC (impl=1 only)
+#   <soc|core>_power.rpt       report_power, default (vectorless) activity (impl=1 only)
+#   <soc|core>_route.dcp       routed checkpoint, for later analysis without a rerun (impl=1 only)
 # <stage> is "opt" (after synthesis and opt_design) or "route" (impl=1).
 
 set script_name area.tcl
@@ -51,6 +55,9 @@ proc implement {prefix impl} {
     route_design
     write_reports $prefix route
     report_timing_summary -max_paths 20 -file ${prefix}_timing_route.rpt
+    report_timing -max_paths 1 -nworst 1 -file ${prefix}_critical.rpt
+    report_power -file ${prefix}_power.rpt
+    write_checkpoint -force ${prefix}_route.dcp
   }
 }
 
@@ -70,6 +77,10 @@ set generics {}
 foreach g [board_generic_list] { lappend generics -generic $g }
 synth_design -top hornet_board -include_dirs [list $rtl/core $rtl/fpu] {*}$generics
 implement soc $impl
+if {$impl} {
+  set core_regs [filter [all_registers -cells] {NAME =~ SOC/CORE/*}]
+  report_timing -from $core_regs -to $core_regs -max_paths 1 -nworst 1 -file soc_core_critical.rpt
+}
 close_design
 
 puts "INFO: reports written to $out_dir"

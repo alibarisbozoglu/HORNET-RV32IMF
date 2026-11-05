@@ -50,6 +50,55 @@ in the logic flattened into the SoC (memories, data router, crossbar, clock and
 reset). Slack is not strictly ordered with size in the out-of-context runs:
 RV32IM has more slack than RV32I.
 
+### Critical paths
+
+| ISA | Path | Slack | Period at zero slack | Data path (logic + route) | Levels |
+|---|---|---:|---:|---:|---:|
+| RV32I | Whole design | +1.552 ns | 18.45 ns (54.2 MHz) | 17.30 ns (4.94 + 12.36) | 17 |
+| RV32I | Inside the core, in the SoC | +4.803 ns | 15.20 ns (65.8 MHz) | 14.82 ns (3.63 + 11.19) | 17 |
+| RV32I | Core alone | +3.658 ns | 16.34 ns (61.2 MHz) | 15.85 ns (4.05 + 11.79) | 15 |
+| RV32IM | Whole design | +1.102 ns | 18.90 ns (52.9 MHz) | 17.96 ns (5.21 + 12.75) | 17 |
+| RV32IM | Inside the core, in the SoC | +2.732 ns | 17.27 ns (57.9 MHz) | 16.95 ns (3.21 + 13.74) | 15 |
+| RV32IM | Core alone | +4.555 ns | 15.45 ns (64.7 MHz) | 15.26 ns (3.25 + 12.01) | 17 |
+| RV32IMF | Whole design | +0.488 ns | 19.51 ns (51.3 MHz) | 19.15 ns (6.42 + 12.72) | 21 |
+| RV32IMF | Inside the core, in the SoC | +0.847 ns | 19.15 ns (52.2 MHz) | 19.06 ns (7.32 + 11.74) | 31 |
+| RV32IMF | Core alone | +1.161 ns | 18.84 ns (53.1 MHz) | 18.78 ns (7.38 + 11.40) | 27 |
+
+Where the paths run:
+
+| ISA | Path | From | To |
+|---|---|---|---|
+| RV32I | Whole design | `SOC/IMEM/mem_reg_0_3` | `SOC/IMEM/mem_reg_1_2` (port B address) |
+| RV32I | Inside the core, in the SoC | `SOC/CORE/MEM_STAGE/store_o_reg` | `SOC/CORE/IF_STAGE/out_pc_q_reg[16]` |
+| RV32I | Core alone | `MEM_STAGE/store_o_reg` | `IF_STAGE/wait_pc_q_reg[23]` |
+| RV32IM | Whole design | `SOC/IMEM/mem_reg_2_1` | `SOC/IMEM/mem_reg_1_3` (port B address) |
+| RV32IM | Inside the core, in the SoC | `SOC/CORE/ID_STAGE/rs2_q_o_reg[2]` | `SOC/CORE/IF_STAGE/pc_q_reg[0]` |
+| RV32IM | Core alone | `ID_STAGE/rs2_q_o_reg[2]` | `IF_STAGE/wait_pc_q_reg[16]` |
+| RV32IMF | Whole design | `SOC/IMEM/mem_reg_0_0` | `SOC/CORE/EX_STAGE/F_FPU.FPU/CVT/mant_q_reg[14]` |
+| RV32IMF | Inside the core, in the SoC | `SOC/CORE/EX_STAGE/F_FPU.FPU/DIVSQRT/q_reg[26]` | `SOC/CORE/EX_STAGE/F_FPU.FPU/out_q_reg[22]` |
+| RV32IMF | Core alone | `EX_STAGE/F_FPU.FPU/DIVSQRT/q_reg[26]` | `EX_STAGE/F_FPU.FPU/out_q_reg[21]` |
+
+"Period at zero slack" is the 20 ns requirement minus the slack. It is not a
+maximum frequency: the tools stop working on timing once 50 MHz is met, so a
+run with a tighter clock may do better. The core alone has only a clock
+constraint, so paths through its ports are not timed. "Inside the core, in the
+SoC" is the worst path with both ends on registers of the `CORE` instance.
+
+### Static power
+
+| ISA | Whole design | Out of context | Junction temperature (whole design) |
+|---|---:|---:|---:|
+| RV32I | 0.099 W | 0.084 W | 26.1 C |
+| RV32IM | 0.099 W | 0.084 W | 26.1 C |
+| RV32IMF | 0.099 W | 0.084 W | 26.1 C |
+
+This is Vivado's Device Static power, with its default operating conditions
+(25 C ambient, 250 LFM airflow, medium heat sink). It is the leakage of the
+whole XC7A100T die, so it does not change with the configuration and it cannot
+be split into core and SoC. The out-of-context figure is not the static power
+of the core: the same die, without the board's I/O. The 0.015 W gap is about
+13 mW on the 3.3 V I/O supply plus about 1 mW each on the BRAM and core supplies.
+
 ### RV32IMF in detail
 
 Setup WNS: whole design +0.488 ns, core alone +1.161 ns.
@@ -119,6 +168,9 @@ in `build/area/<board>/`:
 | `soc_timing_route.rpt` | timing summary (`IMPL=1`) |
 | `core_util_<stage>.rpt`, `core_util_hier_<stage>.rpt` | `hornet_core` synthesized alone, out of context |
 | `core_timing_route.rpt` | its timing summary at the board's core clock (`IMPL=1`) |
+| `soc_critical.rpt`, `soc_core_critical.rpt`, `core_critical.rpt` | worst setup path: whole design, inside the core in the SoC, core alone (`IMPL=1`) |
+| `soc_power.rpt`, `core_power.rpt` | `report_power` with default (vectorless) activity (`IMPL=1`) |
+| `soc_route.dcp`, `core_route.dcp` | routed checkpoints, for later analysis such as power with simulation activity (`IMPL=1`) |
 
 `<stage>` is `opt` (synthesis + `opt_design`) or `route` (`IMPL=1`); the
 summary uses the route reports when they exist, so run `make -C area clean`

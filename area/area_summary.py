@@ -6,7 +6,8 @@
 
 Reads soc_util_hier_<stage>.rpt (route if present, else opt), soc_util_<stage>.rpt
 for the device capacity, core_util_hier_<stage>.rpt (the core synthesized out of
-context) if present, and the timing summaries of both.
+context) if present, the timing summaries of both, and the critical path and
+power reports of the place and route runs.
 
 The core is the hornet_core instance (pipeline, register files, M unit, FPU).
 Everything else is the SoC: IMEM/DMEM, data router, AXI4-Lite bridge and
@@ -123,6 +124,73 @@ def parse_wns(path):
     return None
 
 
+def parse_path(path):
+    """Worst path of a report_timing file: dict of its header fields, or None."""
+    if not os.path.exists(path):
+        return None
+    text = open(path).read()
+    fields = {
+        'slack': r'Slack \(\w+\)\s*:\s*(-?[\d.]+)ns',
+        'source': r'Source:\s+(\S+)',
+        'dest': r'Destination:\s+(\S+)',
+        'req': r'Requirement:\s+([\d.]+)ns',
+        'delay': r'Data Path Delay:\s+([\d.]+)ns',
+        'logic': r'Data Path Delay:.*?logic ([\d.]+)ns',
+        'route': r'Data Path Delay:.*?route ([\d.]+)ns',
+        'levels': r'Logic Levels:\s+(\d+)',
+    }
+    out = {}
+    for key, pattern in fields.items():
+        m = re.search(pattern, text)
+        if not m:
+            return None
+        out[key] = m.group(1)
+    for key in ('slack', 'req', 'delay', 'logic', 'route'):
+        out[key] = float(out[key])
+    out['levels'] = int(out['levels'])
+    return out
+
+
+def parse_power(path):
+    """Header values of a report_power file: dict, or None."""
+    if not os.path.exists(path):
+        return None
+    fields = {
+        'total': r'Total On-Chip Power \(W\)',
+        'dynamic': r'Dynamic \(W\)',
+        'static': r'Device Static \(W\)',
+        'tj': r'Junction Temperature \(C\)',
+    }
+    text = open(path).read()
+    out = {}
+    for key, name in fields.items():
+        m = re.search(r'\|\s*' + name + r'\s*\|\s*([\d.]+)', text)
+        if not m:
+            return None
+        out[key] = float(m.group(1))
+    m = re.search(r'\|\s*Confidence Level\s*\|\s*(\w+)', text)
+    out['confidence'] = m.group(1) if m else '?'
+    return out
+
+
+def path_rows(rdir):
+    """(scope, path) of the critical path reports that exist in rdir."""
+    scopes = (('Whole design (SoC)', 'soc'), ('Inside the core, in the SoC', 'soc_core'),
+              ('Core alone (registers only)', 'core'))
+    rows = [(n, parse_path(f'{rdir}/{p}_critical.rpt')) for n, p in scopes]
+    return [(n, p) for n, p in rows if p]
+
+
+def path_table(rows):
+    lines = ['| Path | Slack | Period at zero slack | Data path | Logic | Route | Levels |',
+             '|---|---:|---:|---:|---:|---:|---:|']
+    for n, p in rows:
+        lines.append(f'| {n} | {p["slack"]:+.3f} ns | {p["req"] - p["slack"]:.2f} ns '
+                     f'({1000 / (p["req"] - p["slack"]):.1f} MHz) | {p["delay"]:.2f} ns | '
+                     f'{p["logic"]:.2f} ns | {p["route"]:.2f} ns | {p["levels"]} |')
+    return lines
+
+
 def label(node):
     """Instance name and module, or only the name for the top ("(top)" module)."""
     return node.name if node.module == '(top)' else f'{node.name} ({node.module})'
@@ -184,6 +252,13 @@ def subtree(node, ref, depth, max_depth):
     return out
 
 
+POWER_NOTE = ('Device static power is the leakage of the whole FPGA die with the design configured, '
+              'so it barely depends on the design and there is no core or SoC share of it. The '
+              'out-of-context figure is lower mostly because it has no board I/O (the 3.3 V I/O '
+              'supply), so it is not the static power of the core. Vivado defaults: 25 C ambient, '
+              '250 LFM airflow, medium heat sink.')
+
+
 def load(rdir):
     """Totals of one configuration: whole design, core, core alone, SoC without core, WNS."""
     stage = 'route' if os.path.exists(f'{rdir}/soc_util_hier_route.rpt') else 'opt'
@@ -197,7 +272,10 @@ def load(rdir):
             'alone': parse_hier(f'{rdir}/core_util_hier_{core_stage}.rpt').values,
             'soc': sub(root.values, core),
             'wns': parse_wns(f'{rdir}/soc_timing_route.rpt'),
-            'wns_alone': parse_wns(f'{rdir}/core_timing_route.rpt')}
+            'wns_alone': parse_wns(f'{rdir}/core_timing_route.rpt'),
+            'paths': path_rows(rdir),
+            'power': parse_power(f'{rdir}/soc_power.rpt'),
+            'power_alone': parse_power(f'{rdir}/core_power.rpt')}
 
 
 def compare(specs):
@@ -230,6 +308,20 @@ def compare(specs):
     wns = lambda w: f'{w:+.3f} ns' if w is not None else '-'
     lines += [f'| {n} | {wns(c["wns"])} | {wns(c["wns_alone"])} |' for n, c in configs]
     lines.append('')
+    if all(c['paths'] for _, c in configs):
+        lines += ['## Critical paths', '',
+                  '| ISA | Path | Slack | Period at zero slack | Data path | Logic | Route | Levels |',
+                  '|---|---|---:|---:|---:|---:|---:|---:|']
+        for n, c in configs:
+            lines += [f'| {n} ' + r for r in path_table(c['paths'])[2:]]
+        lines.append('')
+    if all(c['power'] for _, c in configs):
+        lines += ['## Device static power', '',
+                  '| ISA | Whole design | Out of context | Junction temperature (whole design) |',
+                  '|---|---:|---:|---:|']
+        lines += [f'| {n} | {c["power"]["static"]:.3f} W | {c["power_alone"]["static"]:.3f} W | '
+                  f'{c["power"]["tj"]:.1f} C |' for n, c in configs]
+        lines += ['', POWER_NOTE, '']
     return '\n'.join(lines)
 
 
@@ -298,6 +390,24 @@ def main(argv):
         f'{h} {100 * root.values[k] / avail[k]:.1f}% (of {fmt(avail[k], k)})'
         for k, h in COLUMNS if avail.get(k)) + '.')
     lines.append('')
+
+    paths = path_rows(rdir)
+    if paths:
+        lines += ['## Critical paths', '']
+        lines += path_table(paths)
+        lines += ['']
+        for n, p in paths:
+            lines += [f'- {n}: `{p["source"]}` to `{p["dest"]}`']
+        lines += ['', '"Period at zero slack" is the requirement minus the slack at this clock, not a '
+                  'maximum frequency: the tools stop working on timing once it is met. The core alone '
+                  'has only a clock constraint, so paths through its ports are not timed.', '']
+    power = parse_power(f'{rdir}/soc_power.rpt')
+    if power:
+        lines += ['## Power', '', f'Device static power: **{power["static"]:.3f} W** at junction '
+                  f'temperature {power["tj"]:.1f} C.', '', POWER_NOTE, '',
+                  f'For reference, with default (vectorless) activity and confidence {power["confidence"]}: '
+                  f'dynamic {power["dynamic"]:.3f} W, total {power["total"]:.3f} W. '
+                  'These are not measurements of a workload.', '']
 
     lines += ['## Core breakdown', '',
               f'`{"/".join(a.name for a in ancestors + (core,))}` in the SoC; '
