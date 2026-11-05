@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Core vs SoC area summary from Vivado utilization reports (area/area.tcl).
 
-  area_summary.py <report dir> [-o out.md] [--depth N]
+  area_summary.py <report dir> [-o out.md] [--depth N] [--isa NAME]
+  area_summary.py --compare <isa>=<report dir> [<isa>=<report dir> ...] [-o out.md]
 
 Reads soc_util_hier_<stage>.rpt (route if present, else opt), soc_util_<stage>.rpt
 for the device capacity, core_util_hier_<stage>.rpt (the core synthesized out of
@@ -183,6 +184,55 @@ def subtree(node, ref, depth, max_depth):
     return out
 
 
+def load(rdir):
+    """Totals of one configuration: whole design, core, core alone, SoC without core, WNS."""
+    stage = 'route' if os.path.exists(f'{rdir}/soc_util_hier_route.rpt') else 'opt'
+    root = parse_hier(f'{rdir}/soc_util_hier_{stage}.rpt')
+    core_stage = 'route' if os.path.exists(f'{rdir}/core_util_hier_route.rpt') else 'opt'
+    found = find(root, lambda n: n.module.startswith('hornet_core'))
+    if not found:
+        sys.exit(f'error: no hornet_core instance in the SoC report of {rdir}')
+    core = found[0].values
+    return {'stage': stage, 'whole': root.values, 'core': core,
+            'alone': parse_hier(f'{rdir}/core_util_hier_{core_stage}.rpt').values,
+            'soc': sub(root.values, core),
+            'wns': parse_wns(f'{rdir}/soc_timing_route.rpt'),
+            'wns_alone': parse_wns(f'{rdir}/core_timing_route.rpt')}
+
+
+def compare(specs):
+    """Markdown comparing configurations given as <isa>=<report dir>, smallest first."""
+    configs = [(n.upper(), load(d))
+               for n, d in (a.split('=', 1) for a in specs)]
+    keys = ('lut', 'lutram', 'ff', 'bram', 'dsp')
+    head = ' | '.join(h for k, h in COLUMNS if k in keys)
+    align = '---:|' * len(keys)
+    cells = lambda v: ' | '.join(fmt(v[k], k) for k in keys)
+
+    lines = ['# HORNET FPGA area: ISA configurations', '']
+    stages = {c['stage'] for _, c in configs}
+    lines += ['Numbers ' + ('after place and route.' if stages == {'route'} else
+                            f'at mixed or synthesis stages ({", ".join(sorted(stages))}).'), '']
+    lines += ['## Core in the SoC', '', f'| ISA | {head} |', '|---|' + align]
+    lines += [f'| {n} | {cells(c["core"])} |' for n, c in configs]
+    lines += ['', '## Whole design', '', f'| ISA | {head} |', '|---|' + align]
+    lines += [f'| {n} | {cells(c["whole"])} |' for n, c in configs]
+    lines += ['', '## SoC without core', '', f'| ISA | {head} |', '|---|' + align]
+    lines += [f'| {n} | {cells(c["soc"])} |' for n, c in configs]
+    lines += ['', '## Core alone (out of context)', '', f'| ISA | {head} |', '|---|' + align]
+    lines += [f'| {n} | {cells(c["alone"])} |' for n, c in configs]
+    lines += ['', '## Cost of each step (core in the SoC)', '', f'| Step | {head} |', '|---|' + align]
+    for (na, a), (nb, b) in zip(configs, configs[1:]):
+        d = sub(b['core'], a['core'])
+        step = ' | '.join(f'{d[k]:+g}' if k == 'bram' else f'{int(round(d[k])):+,}' for k in keys)
+        lines.append(f'| {na} to {nb} | {step} |')
+    lines += ['', '## Setup WNS at the board clock', '', '| ISA | Whole design | Core alone |', '|---|---:|---:|']
+    wns = lambda w: f'{w:+.3f} ns' if w is not None else '-'
+    lines += [f'| {n} | {wns(c["wns"])} | {wns(c["wns_alone"])} |' for n, c in configs]
+    lines.append('')
+    return '\n'.join(lines)
+
+
 def main(argv):
     args = argv[1:]
     out_path = None
@@ -195,6 +245,20 @@ def main(argv):
         i = args.index('--depth')
         max_depth = int(args[i + 1])
         del args[i:i + 2]
+    isa = None
+    if '--isa' in args:
+        i = args.index('--isa')
+        isa = args[i + 1]
+        del args[i:i + 2]
+    if '--compare' in args:
+        args.remove('--compare')
+        if not args:
+            sys.exit(__doc__)
+        text = compare(args)
+        if out_path:
+            open(out_path, 'w').write(text)
+        print(text)
+        return
     if len(args) != 1:
         sys.exit(__doc__)
     rdir = args[0]
@@ -215,7 +279,7 @@ def main(argv):
                   'route': 'after place and route'}[stage]
 
     lines = ['# HORNET FPGA area: core vs SoC', '',
-             f'Device {device}, numbers {stage_text}.', '']
+             f'Device {device}{", " + isa if isa else ""}, numbers {stage_text}.', '']
     timing = [(n, parse_wns(f'{rdir}/{p}_timing_route.rpt')) for n, p in
               (('whole design', 'soc'), ('core alone', 'core'))]
     timing = [f'{n} {w:+.3f} ns' for n, w in timing if w is not None]
@@ -275,8 +339,9 @@ def main(argv):
     lines += [
         'BRAM counts 36 Kb blocks (a RAMB18 is half). "LUTs" is LUT as logic + LUTRAM + SRL.',
         'Small modules that Vivado flattens into their parent show up in the "other" and',
-        '"flattened" rows. After place and route these rows can be slightly negative:',
-        'phys_opt_design moves and replicates logic across hierarchy boundaries.',
+        '"flattened" rows. These rows can be slightly negative: in Vivado\'s hierarchical',
+        'report the child instances can add up to a few dozen LUTs more than their parent,',
+        'already after opt_design.',
         '',
     ]
     text = '\n'.join(lines)

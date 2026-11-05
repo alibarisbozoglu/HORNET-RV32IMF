@@ -1,16 +1,58 @@
 # FPGA area: core vs SoC
 
-LUT, FF, BRAM and DSP usage of HORNET, split into the core (`hornet_core`:
-pipeline, register files, M unit, FPU) and the rest of the SoC (IMEM/DMEM,
+LUT, FF, BRAM and DSP usage of HORNET for each ISA configuration (RV32I,
+RV32IM, RV32IMF), split into the core (`hornet_core`:
+pipeline, register files, and the M unit and FPU when configured) and the rest of the SoC (IMEM/DMEM,
 data router, AXI4-Lite bridge and crossbar, timer, UART, GPIO, sysctl, board
 clock and reset). Vivado runs on the host, as for `make fpga-build`.
 
 ## Results
 
 Nexys 4 DDR (XC7A100T-1CSG324), Vivado 2026.1, after place and route
-(`make -C area IMPL=1`), RTL at commit `59412a9` (v2.1.0), RV32IMF (`RV_M=1`,
-`RV_F=1`), 64 KiB IMEM and 64 KiB DMEM, 50 MHz core clock. Setup WNS: whole
-design +0.488 ns, core alone +1.161 ns.
+(`make -C area all IMPL=1`), RTL at commit `59412a9` (v2.1.0), 64 KiB IMEM and
+64 KiB DMEM, 50 MHz core clock.
+
+### ISA configurations
+
+Core in the SoC:
+
+| ISA | LUTs | LUTRAM | FFs | BRAM (36 Kb) | DSPs |
+|---|---:|---:|---:|---:|---:|
+| RV32I | 2,317 | 44 | 1,036 | 0 | 0 |
+| RV32IM | 2,768 | 44 | 1,280 | 0 | 4 |
+| RV32IMF | 6,016 | 110 | 1,980 | 0 | 6 |
+
+Whole design and timing:
+
+| ISA | LUTs | LUTRAM | FFs | BRAM (36 Kb) | DSPs | SoC without core (LUTs / FFs) | Setup WNS |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| RV32I | 2,939 | 56 | 1,838 | 32 | 0 | 622 / 802 | +1.552 ns |
+| RV32IM | 3,405 | 56 | 2,082 | 32 | 4 | 637 / 802 | +1.102 ns |
+| RV32IMF | 6,638 | 122 | 2,783 | 32 | 6 | 622 / 803 | +0.488 ns |
+
+Core alone (out of context):
+
+| ISA | LUTs | LUTRAM | FFs | BRAM (36 Kb) | DSPs | Setup WNS |
+|---|---:|---:|---:|---:|---:|---:|
+| RV32I | 2,458 | 44 | 1,569 | 0 | 0 | +3.658 ns |
+| RV32IM | 2,908 | 44 | 1,776 | 0 | 4 | +4.555 ns |
+| RV32IMF | 6,432 | 110 | 2,497 | 0 | 6 | +1.161 ns |
+
+Cost of each extension (core in the SoC):
+
+| Step | LUTs | LUTRAM | FFs | DSPs |
+|---|---:|---:|---:|---:|
+| RV32I to RV32IM | +451 | +0 | +244 | +4 |
+| RV32IM to RV32IMF | +3,248 | +66 | +700 | +2 |
+
+The SoC peripherals are the same in all three; the 15 extra LUTs of RV32IM are
+in the logic flattened into the SoC (memories, data router, crossbar, clock and
+reset). Slack is not strictly ordered with size in the out-of-context runs:
+RV32IM has more slack than RV32I.
+
+### RV32IMF in detail
+
+Setup WNS: whole design +0.488 ns, core alone +1.161 ns.
 
 | | LUTs | LUT as logic | LUTRAM | FFs | BRAM (36 Kb) | DSPs |
 |---|---:|---:|---:|---:|---:|---:|
@@ -37,8 +79,10 @@ Core in the SoC, by block:
 | CSR_UNIT (csr_unit) | 82 | 318 | 0 | 1.4% |
 | WB_STAGE (wb_stage) | 51 | 33 | 0 | 0.8% |
 
-The blocks add up to 29 LUTs more than the core: after placement,
-`phys_opt_design` moves and replicates logic across hierarchy boundaries.
+The blocks add up to 29 LUTs more than the core: Vivado's hierarchical report
+shows this kind of difference already after `opt_design`. In RV32I and RV32IM
+synthesis does not keep `regfile` as its own instance, so the generated reports
+show its 44 LUTRAMs under "other CORE logic".
 
 SoC without core, by block:
 
@@ -56,13 +100,17 @@ The 32 BRAMs are IMEM and DMEM (16 each for 64 KiB).
 ## Running
 
 ```
-make -C area                     # Nexys 4 DDR, synthesis + opt_design
+make -C area                     # Nexys 4 DDR, RV32IMF, synthesis + opt_design
+make -C area ISA=rv32im          # another ISA: rv32i, rv32im, rv32imf
 make -C area IMPL=1              # also place and route + timing
+make -C area all IMPL=1          # all three ISAs, then compare.md (about 7 minutes each)
 make -C area BOARD=nexysvideo    # another board (any fpga/<board>/ with board.tcl)
 make -C area summary DEPTH=3     # rebuild area.md only, deeper core breakdown
+make -C area compare             # rebuild compare.md only
 ```
 
-Output in `build/area/<board>/`:
+Output in `build/area/<board>/<isa>/`, and `compare.md` (all ISAs side by side)
+in `build/area/<board>/`:
 
 | File | Content |
 |---|---|
@@ -87,7 +135,8 @@ The core is given two ways:
   The in-SoC number is the cost of the core as it is used.
 
 The memories come from the default images in `fpga/default/` (64 KiB IMEM and
-64 KiB DMEM); the BRAM count of the SoC scales with `IMEM_SIZE`/`DMEM_SIZE`.
+64 KiB DMEM) in every configuration. Those images are built for RV32IMF, so the
+RV32I and RV32IM runs measure area and are not meant to be booted; the BRAM count of the SoC scales with `IMEM_SIZE`/`DMEM_SIZE`.
 
 Files: `area.tcl` (Vivado), `area_summary.py` (report parser), `Makefile`.
 Nothing outside this folder is changed; `area.tcl` reuses
